@@ -9,7 +9,6 @@ class Database:
         self.col = self.db.users
 
     def new_user(self, id, name):
-        import time
         return dict(
             id = id,
             name = name,
@@ -18,7 +17,27 @@ class Database:
             premium_expiry = None,
             downloads_today = 0,
             last_download_date = None,
-            joined_at = time.time()
+            # Forward settings
+            forward_destination = None,  # Channel ID for forwarding
+            custom_caption = None,  # Custom caption template
+            custom_thumbnail = None,  # File ID of custom thumbnail
+            filename_suffix = None,  # Suffix for filename
+            index_count = 0,  # Counter for {IndexCount} variable
+            # Send as document toggle
+            send_as_document = False,  # If True, send videos/photos/audio as documents
+            # Replace words settings
+            replace_caption_words = None,  # Pattern: "find1:change1|find2:change2"
+            replace_filename_words = None,  # Pattern: "find1:change1|find2:change2"
+            # File type filters (all enabled by default)
+            filter_text = True,
+            filter_document = True,
+            filter_video = True,
+            filter_photo = True,
+            filter_audio = True,
+            filter_voice = True,
+            filter_animation = True,
+            filter_sticker = True,
+            filter_poll = True
         )
     
     async def add_user(self, id, name):
@@ -35,21 +54,6 @@ class Database:
 
     async def get_all_users(self):
         return self.col.find({})
-    
-    async def get_all_users_data(self):
-        """Get all users with full details for export"""
-        users_data = []
-        cursor = self.col.find({})
-        async for user in cursor:
-            users_data.append({
-                'user_id': user.get('id'),
-                'name': user.get('name'),
-                'is_premium': user.get('is_premium', False),
-                'joined_at': user.get('joined_at'),
-                'downloads_today': user.get('downloads_today', 0),
-                'last_download_date': user.get('last_download_date')
-            })
-        return users_data
 
     async def delete_user(self, user_id):
         await self.col.delete_many({'id': int(user_id)})
@@ -97,19 +101,14 @@ class Database:
         return premium_users
     
     # Download tracking for rate limiting
-    async def check_download_limit(self, user_id, count=1):
-        """Check if user can download 'count' files without exceeding limit"""
-        from datetime import date
+    async def check_and_update_downloads(self, user_id):
+        """Check and update download count for rate limiting"""
+        from datetime import datetime, date
         
         user = await self.col.find_one({'id': int(user_id)})
         if not user:
             return False
         
-        # Premium users have unlimited downloads
-        is_premium_user = await self.is_premium(user_id)
-        if is_premium_user:
-            return True
-        
         today = str(date.today())
         last_date = user.get('last_download_date')
         downloads_today = user.get('downloads_today', 0)
@@ -118,36 +117,19 @@ class Database:
         if last_date != today:
             downloads_today = 0
         
-        # Check if user has enough limit left for 'count' downloads
-        limit = 100  # Free users: 100/day
-        return (downloads_today + count) <= limit
-    
-    async def increment_download_count(self, user_id):
-        """Increment download count after successful download (only for non-premium)"""
-        from datetime import date
-        
-        # Premium users don't have download limits
+        # Check limits
         is_premium_user = await self.is_premium(user_id)
-        if is_premium_user:
-            return
+        limit = 999999 if is_premium_user else 10  # Premium: Unlimited, Free: 10/day
         
-        user = await self.col.find_one({'id': int(user_id)})
-        if not user:
-            return
-        
-        today = str(date.today())
-        last_date = user.get('last_download_date')
-        downloads_today = user.get('downloads_today', 0)
-        
-        # Reset if new day
-        if last_date != today:
-            downloads_today = 0
+        if downloads_today >= limit:
+            return False  # Limit exceeded
         
         # Update count
         await self.col.update_one(
             {'id': int(user_id)},
             {'$set': {'downloads_today': downloads_today + 1, 'last_download_date': today}}
         )
+        return True
     
     async def get_download_count(self, user_id):
         """Get today's download count"""
@@ -161,48 +143,332 @@ class Database:
             return user.get('downloads_today', 0)
         return 0
     
-    # Premium extension method
-    async def extend_premium(self, user_id, days):
-        """Extend premium membership by adding days to current expiry"""
-        import time
+    # Forward settings methods
+    async def set_forward_destination(self, user_id, channel_id):
+        """Set forward destination channel"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'forward_destination': channel_id}}
+        )
+    
+    async def get_forward_destination(self, user_id):
+        """Get forward destination channel"""
+        user = await self.col.find_one({'id': int(user_id)})
+        return user.get('forward_destination') if user else None
+    
+    async def set_custom_caption(self, user_id, caption):
+        """Set custom caption template"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'custom_caption': caption}}
+        )
+    
+    async def get_custom_caption(self, user_id):
+        """Get custom caption template"""
+        user = await self.col.find_one({'id': int(user_id)})
+        return user.get('custom_caption') if user else None
+    
+    async def set_custom_thumbnail(self, user_id, file_id):
+        """Set custom thumbnail file ID"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'custom_thumbnail': file_id}}
+        )
+    
+    async def get_custom_thumbnail(self, user_id):
+        """Get custom thumbnail file ID"""
+        user = await self.col.find_one({'id': int(user_id)})
+        return user.get('custom_thumbnail') if user else None
+    
+    async def set_filename_suffix(self, user_id, suffix):
+        """Set filename suffix"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'filename_suffix': suffix}}
+        )
+    
+    async def get_filename_suffix(self, user_id):
+        """Get filename suffix"""
+        user = await self.col.find_one({'id': int(user_id)})
+        return user.get('filename_suffix') if user else None
+    
+    async def increment_index_count(self, user_id):
+        """Get current index count and increment for next use"""
+        # Get current value first
+        user = await self.col.find_one({'id': int(user_id)})
+        current_count = user.get('index_count', 0) if user else 0
+        
+        # Increment for next time
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$inc': {'index_count': 1}}
+        )
+        
+        return current_count
+    
+    async def reset_index_count(self, user_id):
+        """Reset index count to 0"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'index_count': 0}}
+        )
+    
+    async def set_index_count(self, user_id, count):
+        """Set index count to specific number"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'index_count': int(count)}}
+        )
+    
+    async def get_index_count(self, user_id):
+        """Get current index count"""
+        user = await self.col.find_one({'id': int(user_id)})
+        return user.get('index_count', 0) if user else 0
+    
+    async def get_user_settings(self, user_id):
+        """Get all user settings"""
         user = await self.col.find_one({'id': int(user_id)})
         if not user:
             return None
+        return {
+            'forward_destination': user.get('forward_destination'),
+            'custom_caption': user.get('custom_caption'),
+            'custom_thumbnail': user.get('custom_thumbnail'),
+            'filename_suffix': user.get('filename_suffix'),
+            'index_count': user.get('index_count', 0),
+            # Replace words settings
+            'replace_caption_words': user.get('replace_caption_words'),
+            'replace_filename_words': user.get('replace_filename_words'),
+            # File type filters
+            'filter_text': user.get('filter_text', True),
+            'filter_document': user.get('filter_document', True),
+            'filter_video': user.get('filter_video', True),
+            'filter_photo': user.get('filter_photo', True),
+            'filter_audio': user.get('filter_audio', True),
+            'filter_voice': user.get('filter_voice', True),
+            'filter_animation': user.get('filter_animation', True),
+            'filter_sticker': user.get('filter_sticker', True),
+            'filter_poll': user.get('filter_poll', True)
+        }
+    
+    # Filter methods
+    async def toggle_filter(self, user_id, filter_name):
+        """Toggle a file type filter on/off"""
+        user = await self.col.find_one({'id': int(user_id)})
+        if not user:
+            return False
         
-        duration = days * 24 * 60 * 60  # Convert days to seconds
-        current_expiry = user.get('premium_expiry')
-        
-        # If user has active premium, extend from current expiry
-        # Otherwise, start from now
-        if current_expiry and current_expiry > time.time():
-            new_expiry = current_expiry + duration
-        else:
-            new_expiry = time.time() + duration
+        current_value = user.get(filter_name, True)
+        new_value = not current_value
         
         await self.col.update_one(
             {'id': int(user_id)},
-            {'$set': {'is_premium': True, 'premium_expiry': new_expiry}}
+            {'$set': {filter_name: new_value}}
         )
-        return new_expiry
+        return new_value
+    
+    async def get_filter_status(self, user_id, filter_name):
+        """Get status of a specific filter"""
+        user = await self.col.find_one({'id': int(user_id)})
+        if not user:
+            return True  # Default enabled
+        return user.get(filter_name, True)
+    
+    # Send as document toggle methods
+    async def toggle_send_as_document(self, user_id):
+        """Toggle send as document setting"""
+        user = await self.col.find_one({'id': int(user_id)})
+        if not user:
+            return False
+        
+        current_value = user.get('send_as_document', False)
+        new_value = not current_value
+        
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'send_as_document': new_value}}
+        )
+        return new_value
+    
+    async def get_send_as_document(self, user_id):
+        """Get send as document status"""
+        user = await self.col.find_one({'id': int(user_id)})
+        if not user:
+            return False  # Default to media
+        return user.get('send_as_document', False)
+    
+    # Replace words methods
+    async def set_replace_caption_words(self, user_id, pattern):
+        """Set caption word replacement pattern"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'replace_caption_words': pattern}}
+        )
+    
+    async def get_replace_caption_words(self, user_id):
+        """Get caption word replacement pattern"""
+        user = await self.col.find_one({'id': int(user_id)})
+        return user.get('replace_caption_words') if user else None
+    
+    async def set_replace_filename_words(self, user_id, pattern):
+        """Set filename word replacement pattern"""
+        await self.col.update_one(
+            {'id': int(user_id)},
+            {'$set': {'replace_filename_words': pattern}}
+        )
+    
+    async def get_replace_filename_words(self, user_id):
+        """Get filename word replacement pattern"""
+        user = await self.col.find_one({'id': int(user_id)})
+        return user.get('replace_filename_words') if user else None
+    
+    # Global settings methods
+    async def get_global_setting(self, key, default=None):
+        """Get a global setting value"""
+        settings_col = self.db.global_settings
+        setting = await settings_col.find_one({'key': key})
+        return setting.get('value') if setting else default
+    
+    async def set_global_setting(self, key, value):
+        """Set a global setting value"""
+        settings_col = self.db.global_settings
+        await settings_col.update_one(
+            {'key': key},
+            {'$set': {'key': key, 'value': value}},
+            upsert=True
+        )
+    
+    async def get_all_global_settings(self):
+        """Get all global settings as a dictionary"""
+        settings_col = self.db.global_settings
+        cursor = settings_col.find({})
+        settings = {}
+        async for setting in cursor:
+            settings[setting['key']] = setting['value']
+        return settings
+    
+    async def init_global_settings(self):
+        """Initialize global settings with defaults if not exist"""
+        defaults = {
+            'pricing_1day': 10,
+            'pricing_7day': 40,
+            'pricing_30day': 100,
+            'pricing_1day_usd': 0.15,
+            'pricing_7day_usd': 0.50,
+            'pricing_30day_usd': 1.20,
+            'admin_telegram_handle': '@tataa_sumo',
+            'help_footer': 'For support, contact admin',
+            'free_daily_limit': 10,
+            'premium_daily_limit': 999999
+        }
+        
+        for key, value in defaults.items():
+            existing = await self.get_global_setting(key)
+            if existing is None:
+                await self.set_global_setting(key, value)
+    
+    # Force subscribe channels methods
+    async def get_force_sub_channels(self):
+        """Get all force subscribe channels"""
+        channels_col = self.db.force_sub_channels
+        channel_doc = await channels_col.find_one({'_id': 'channels'})
+        return channel_doc.get('channels', []) if channel_doc else []
+    
+    async def add_force_sub_channel(self, channel_id, channel_username=None):
+        """Add a force subscribe channel (max 4)"""
+        channels = await self.get_force_sub_channels()
+        
+        if len(channels) >= 4:
+            return False, "Maximum 4 channels allowed"
+        
+        # Check if already exists
+        for ch in channels:
+            if ch['id'] == channel_id:
+                return False, "Channel already added"
+        
+        channels.append({
+            'id': int(channel_id),
+            'username': channel_username
+        })
+        
+        channels_col = self.db.force_sub_channels
+        await channels_col.update_one(
+            {'_id': 'channels'},
+            {'$set': {'channels': channels}},
+            upsert=True
+        )
+        return True, "Channel added successfully"
+    
+    async def remove_force_sub_channel(self, channel_id):
+        """Remove a force subscribe channel"""
+        channels = await self.get_force_sub_channels()
+        channels = [ch for ch in channels if ch['id'] != int(channel_id)]
+        
+        channels_col = self.db.force_sub_channels
+        await channels_col.update_one(
+            {'_id': 'channels'},
+            {'$set': {'channels': channels}},
+            upsert=True
+        )
+        return True
+    
+    # UPI payment details methods
+    async def get_upi_details(self):
+        """Get UPI payment details"""
+        upi_col = self.db.upi_details
+        upi = await upi_col.find_one({'_id': 'upi'})
+        return {
+            'upi_id': upi.get('upi_id') if upi else None,
+            'receiver_name': upi.get('receiver_name') if upi else None,
+            'qr_file_id': upi.get('qr_file_id') if upi else None
+        }
+    
+    async def set_upi_id(self, upi_id):
+        """Set UPI ID"""
+        upi_col = self.db.upi_details
+        await upi_col.update_one(
+            {'_id': 'upi'},
+            {'$set': {'upi_id': upi_id}},
+            upsert=True
+        )
+    
+    async def set_receiver_name(self, receiver_name):
+        """Set receiver name for UPI"""
+        upi_col = self.db.upi_details
+        await upi_col.update_one(
+            {'_id': 'upi'},
+            {'$set': {'receiver_name': receiver_name}},
+            upsert=True
+        )
+    
+    async def set_upi_qr(self, qr_file_id):
+        """Set UPI QR code file ID (for static QR - optional)"""
+        upi_col = self.db.upi_details
+        await upi_col.update_one(
+            {'_id': 'upi'},
+            {'$set': {'qr_file_id': qr_file_id}},
+            upsert=True
+        )
+    
+    async def clear_upi_details(self):
+        """Clear all UPI details"""
+        upi_col = self.db.upi_details
+        await upi_col.delete_one({'_id': 'upi'})
     
     # Banned users methods
-    async def ban_user(self, user_id, reason, banned_by):
+    async def ban_user(self, user_id, reason=None):
         """Ban a user from using the bot"""
         import time
         banned_col = self.db.banned_users
-        
-        # Check if already banned
-        existing = await banned_col.find_one({'user_id': int(user_id)})
-        if existing:
-            return False  # Already banned
-        
-        await banned_col.insert_one({
-            'user_id': int(user_id),
-            'reason': reason,
-            'banned_by': int(banned_by),
-            'banned_at': time.time()
-        })
-        return True
+        await banned_col.update_one(
+            {'user_id': int(user_id)},
+            {'$set': {
+                'user_id': int(user_id),
+                'reason': reason,
+                'banned_at': time.time()
+            }},
+            upsert=True
+        )
     
     async def unban_user(self, user_id):
         """Unban a user"""
@@ -214,16 +480,61 @@ class Database:
         """Check if user is banned"""
         banned_col = self.db.banned_users
         banned = await banned_col.find_one({'user_id': int(user_id)})
-        return banned
+        return banned is not None
+    
+    async def get_ban_info(self, user_id):
+        """Get ban info for a user"""
+        banned_col = self.db.banned_users
+        return await banned_col.find_one({'user_id': int(user_id)})
     
     async def get_all_banned_users(self):
         """Get all banned users"""
         banned_col = self.db.banned_users
-        banned_users = []
         cursor = banned_col.find({})
+        banned_users = []
         async for user in cursor:
             banned_users.append(user)
         return banned_users
+    
+    # Crypto payment methods
+    async def create_crypto_invoice(self, invoice_id, user_id, plan, amount, asset, pay_url):
+        """Store a crypto payment invoice"""
+        import time
+        crypto_col = self.db.crypto_payments
+        await crypto_col.insert_one({
+            'invoice_id': invoice_id,
+            'user_id': int(user_id),
+            'plan': plan,
+            'amount': float(amount),
+            'asset': asset,
+            'pay_url': pay_url,
+            'status': 'pending',
+            'created_at': time.time()
+        })
+    
+    async def get_crypto_invoice(self, invoice_id):
+        """Get crypto invoice by ID"""
+        crypto_col = self.db.crypto_payments
+        return await crypto_col.find_one({'invoice_id': invoice_id})
+    
+    async def update_crypto_invoice_status(self, invoice_id, status, paid_at=None):
+        """Update crypto invoice status"""
+        crypto_col = self.db.crypto_payments
+        update_data = {'status': status}
+        if paid_at:
+            update_data['paid_at'] = paid_at
+        await crypto_col.update_one(
+            {'invoice_id': invoice_id},
+            {'$set': update_data}
+        )
+    
+    async def get_pending_crypto_invoices(self, user_id):
+        """Get pending crypto invoices for a user"""
+        crypto_col = self.db.crypto_payments
+        cursor = crypto_col.find({'user_id': int(user_id), 'status': 'pending'})
+        invoices = []
+        async for inv in cursor:
+            invoices.append(inv)
+        return invoices
 
 db = Database(DB_URI, DB_NAME)
-
