@@ -2,21 +2,15 @@ import time
 import random
 import string
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from database.db import db
 from config import ADMINS
 
 # Store active redeem codes (in production, use database)
 redeem_codes = {}
 
-# Store generation state for admins
+# Store generation state for multi-code generation
 generation_state = {}
-
-# Custom filter to check if admin is in generation state
-def in_generation_state(_, __, message):
-    return message.from_user.id in generation_state
-
-generation_filter = filters.create(in_generation_state)
 
 # Generate redeem code
 @Client.on_message(filters.private & filters.command(["generate"]) & filters.user(ADMINS))
@@ -31,60 +25,6 @@ async def generate_redeem_code(client: Client, message: Message):
         "**🎟️ Generate Redeem Code**\n\nSelect duration:",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
-
-# Handle quantity input from admin
-@Client.on_message(filters.private & filters.text & filters.user(ADMINS) & generation_filter)
-async def handle_quantity_input(client: Client, message: Message):
-    """Handle quantity input for code generation"""
-    # Get the quantity
-    try:
-        quantity = int(message.text.strip())
-    except ValueError:
-        await message.reply("❌ **Invalid input!** Please enter a number between 1 and 50.")
-        return
-
-    # Validate quantity
-    if quantity < 1 or quantity > 50:
-        await message.reply("❌ **Invalid quantity!** Please enter a number between 1 and 50.")
-        return
-
-    # Get days from state
-    days = generation_state[message.from_user.id]['days']
-
-    # Generate codes
-    codes_list = []
-    for _ in range(quantity):
-        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-
-        # Store code
-        redeem_codes[code] = {
-            'days': days,
-            'generated_by': message.from_user.id,
-            'generated_at': time.time()
-        }
-
-        codes_list.append(code)
-
-    # Clear generation state
-    del generation_state[message.from_user.id]
-
-    # Format codes in monospace
-    codes_text = "\n".join([f"`{code}`" for code in codes_list])
-
-    await message.reply(f"""
-✅ **{quantity} Redeem Code(s) Generated!**
-
-**Duration:** {days} day(s)
-**Codes:**
-
-{codes_text}
-
-**Instructions:**
-Share these codes with users. They can redeem using:
-`/redeem <code>`
-
-**Note:** Each code is single-use and will be deleted after redemption.
-""")
 
 # Premium membership menu
 @Client.on_message(filters.private & filters.command(["premium"]))
@@ -103,46 +43,43 @@ async def premium_menu(client: Client, message: Message):
         else:
             expiry_text = "**Lifetime Premium**"
         
-        text = f"""**💎 Premium Member**
+        text = f"""**💎 Premium Status**
 
-✅ You have Premium!
+✅ **You have Premium!**
 
 {expiry_text}
 **Usage Today:** {downloads_today} downloads (Unlimited)
 
 **Benefits:**
-✅ Unlimited downloads
+✅ Unlimited downloads/day
 ✅ Priority support
 ✅ Faster processing
 
-Want more time? Extend your premium!"""
-        buttons = [[
-            InlineKeyboardButton("🔄 Extend Premium", callback_data="extend_premium")
-        ],[
-            InlineKeyboardButton("🏠 Main Menu", callback_data="start")
-        ]]
+Want to extend your premium membership?"""
+        
+        buttons = [
+            [InlineKeyboardButton("⏰ Extend Premium", callback_data="premium_select_plan")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="start")]
+        ]
     else:
+        # Free user - show benefits and upgrade option
         text = f"""**💎 Premium Membership**
 
-**Current Plan:** Free
-**Usage Today:** {downloads_today}/100
+**Current Plan:** 🆓 Free
+**Usage:** {downloads_today}/10 today
 
 **Premium Benefits:**
-✅ Unlimited downloads (vs 100/day)
-✅ Priority support
-✅ Faster processing
+✅ **Unlimited downloads** (no daily limit)
+✅ **Priority support**
+✅ **Faster processing**
+✅ **No ads**
 
-**💰 Pricing:**
-• **₹10** / $0.15 - 1 Day
-• **₹40** / $0.50 - 7 Days
-• **₹100** / $1.20 - 30 Days
-
-Click below to upgrade!"""
-        buttons = [[
-            InlineKeyboardButton("💎 Upgrade to Premium", callback_data="upgrade_premium")
-        ],[
-            InlineKeyboardButton("🏠 Main Menu", callback_data="start")
-        ]]
+Upgrade to premium and unlock all features!"""
+        
+        buttons = [
+            [InlineKeyboardButton("⬆️ Upgrade to Premium", callback_data="premium_select_plan")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="start")]
+        ]
     
     await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -161,23 +98,42 @@ async def redeem_code(client: Client, message: Message):
     code_info = redeem_codes[code]
     days = code_info['days']
     
-    # Extend premium (adds to existing if already premium)
-    new_expiry = await db.extend_premium(message.from_user.id, days)
+    # Check if user already has premium
+    user = await db.col.find_one({'id': message.from_user.id})
+    is_premium_user = await db.is_premium(message.from_user.id)
+    
+    # Calculate new expiry time
+    duration = days * 24 * 60 * 60  # Convert to seconds
+    
+    if is_premium_user and user.get('premium_expiry'):
+        # Extend existing subscription
+        current_expiry = user.get('premium_expiry')
+        if current_expiry > time.time():
+            # Add to existing time
+            expiry_time = current_expiry + duration
+            status_msg = "extended"
+        else:
+            # Expired, start fresh
+            expiry_time = time.time() + duration
+            status_msg = "activated"
+    else:
+        # New subscription
+        expiry_time = time.time() + duration
+        status_msg = "activated"
+    
+    # Set premium
+    await db.set_premium(message.from_user.id, True, expiry_time)
     
     # Remove used code
     del redeem_codes[code]
     
     from datetime import datetime
-    expiry_date = datetime.fromtimestamp(new_expiry).strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Check if it was an extension
-    is_premium_user = await db.is_premium(message.from_user.id)
-    action = "Extended" if is_premium_user else "Activated"
+    expiry_date = datetime.fromtimestamp(expiry_time).strftime('%Y-%m-%d %H:%M:%S')
     
     await message.reply(f"""
-✅ **Premium {action}!**
+✅ **Premium {status_msg.capitalize()}!**
 
-**Duration Added:** {days} day(s)
+**Added Duration:** {days} day(s)
 **New Expiry:** {expiry_date}
 
 **Benefits:**
@@ -185,9 +141,8 @@ async def redeem_code(client: Client, message: Message):
 • Priority support
 • Faster downloads
 
-Thank you! 🎉
+Thank you for upgrading! 🎉
 """)
-
 
 # View all premium members (Admin only)
 @Client.on_message(filters.private & filters.command(["premiumlist"]) & filters.user(ADMINS))
@@ -213,58 +168,116 @@ async def list_premium_users(client: Client, message: Message):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
-# Payment with Telegram Stars
-@Client.on_callback_query(filters.regex(r"^pay_stars_"))
-async def handle_stars_payment(client: Client, query):
-    stars_amount = int(query.data.split("_")[-1])
-    
-    # Create invoice
-    await query.message.reply_invoice(
-        title="Premium Membership",
-        description=f"Get {stars_amount} hour(s) of premium access",
-        payload=f"premium_{stars_amount}h",
-        currency="XTR",  # Telegram Stars
-        prices=[LabeledPrice(label="Premium", amount=stars_amount)]
-    )
-    
-    await query.answer()
 
-# Handle successful payment
-@Client.on_pre_checkout_query()
-async def on_pre_checkout_query(client: Client, query: PreCheckoutQuery):
-    await query.answer(ok=True)
 
-@Client.on_message(filters.successful_payment)
-async def on_successful_payment(client: Client, message: Message):
-    payment = message.successful_payment
-    payload = payment.invoice_payload
-    
-    # Extract hours from payload
-    hours = int(payload.split("_")[1].replace("h", ""))
-    
-    # Calculate expiry
-    duration = hours * 60 * 60  # Convert to seconds
-    expiry_time = time.time() + duration
-    
-    # Set premium
-    await db.set_premium(message.from_user.id, True, expiry_time)
-    
-    from datetime import datetime
-    expiry_date = datetime.fromtimestamp(expiry_time).strftime('%Y-%m-%d %H:%M:%S')
-    
-    await message.reply(f"""
-✅ **Payment Successful!**
+# Telegram Stars payment handlers disabled - requires newer Pyrogram version
+# @Client.on_pre_checkout_query()
+# async def on_pre_checkout_query(client: Client, query):
+#     await query.answer(ok=True)
 
-**Premium Activated:** {hours} hour(s)
-**Expires:** {expiry_date}
+# @Client.on_message(filters.successful_payment)
+# async def on_successful_payment(client: Client, message: Message):
+#     payment = message.successful_payment
+#     payload = payment.invoice_payload
+#     
+#     # Extract hours from payload
+#     hours = int(payload.split("_")[1].replace("h", ""))
+#     
+#     # Calculate expiry
+#     duration = hours * 60 * 60  # Convert to seconds
+#     expiry_time = time.time() + duration
+#     
+#     # Set premium
+#     await db.set_premium(message.from_user.id, True, expiry_time)
+#     
+#     from datetime import datetime
+#     expiry_date = datetime.fromtimestamp(expiry_time).strftime('%Y-%m-%d %H:%M:%S')
+#     
+#     await message.reply(f"""
+# ✅ **Payment Successful!**
+# 
+# **Premium Activated:** {hours} hour(s)
+# **Expires:** {expiry_date}
+# 
+# **Benefits:**
+# • Unlimited downloads per day
+# • Priority support  
+# • Faster downloads
+# 
+# Thank you for your support! 🎉
+# """)
 
-**Benefits:**
-• Unlimited downloads per day
-• Priority support
-• Faster downloads
+# Handle amount input for code generation
+@Client.on_message(filters.private & filters.text & filters.user(ADMINS), group=10)
+async def handle_code_amount(client: Client, message: Message):
+    user_id = message.from_user.id
+    
+    # Check if user is in generation state - if not, let other handlers process
+    if user_id not in generation_state:
+        return  # Continue to other handlers
+    
+    # Get the state
+    state = generation_state[user_id]
+    days = state['days']
+    
+    # Validate amount
+    try:
+        amount = int(message.text.strip())
+        if amount < 1 or amount > 50:
+            await message.reply("❌ **Invalid amount!**\n\nPlease enter a number between 1 and 50.")
+            return
+    except ValueError:
+        await message.reply("❌ **Invalid input!**\n\nPlease enter a valid number between 1 and 50.")
+        return
+    
+    # Generate codes
+    codes = []
+    codes_plain = []  # For display in mono format
+    for _ in range(amount):
+        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        redeem_codes[code] = {
+            'days': days,
+            'generated_by': user_id,
+            'generated_at': time.time()
+        }
+        codes.append(f"`/redeem {code}`")  # Mono style for easy copying
+        codes_plain.append(f"/redeem {code}")
+    
+    # Clear state
+    del generation_state[user_id]
+    
+    # Send codes
+    codes_text = "\n".join(codes)
+    codes_plain_text = "\n".join(codes_plain)
+    
+    response = f"""✅ **{amount} Redeem Code(s) Generated!**
 
-Thank you for your support! 🎉
-""")
+**Duration:** {days} day(s) each
+
+**Codes (tap to copy):**
+{codes_text}
+
+**Copy All:**
+```
+{codes_plain_text}
+```
+
+**Note:** Each code is single-use and will be deleted after redemption."""
+    
+    # Split into multiple messages if too long
+    if len(response) > 4000:
+        await message.reply(f"✅ **{amount} Redeem Code(s) Generated!**\n\n**Duration:** {days} day(s) each\n\n**Sending codes...**")
+        
+        # Send in chunks
+        chunk_size = 40  # Reduced to account for formatting
+        for i in range(0, len(codes), chunk_size):
+            chunk = codes[i:i+chunk_size]
+            chunk_text = "\n".join(chunk)
+            chunk_plain = codes_plain[i:i+chunk_size]
+            chunk_plain_text = "\n".join(chunk_plain)
+            await message.reply(f"**Codes {i+1}-{min(i+chunk_size, amount)}:**\n{chunk_text}\n\n**Copy All:**\n```\n{chunk_plain_text}\n```")
+    else:
+        await message.reply(response)
 
 # Callback handlers
 @Client.on_callback_query(filters.regex(r"^(gen_|removepremium_)"))
@@ -273,19 +286,23 @@ async def premium_callback_handler(client: Client, query):
     
     if data.startswith("gen_"):
         days = int(data.split("_")[1])
-
-        # Store the days in generation state
-        generation_state[query.from_user.id] = {'days': days}
-
+        
+        # Store state for multi-code generation
+        generation_state[query.from_user.id] = {
+            'days': days,
+            'timestamp': time.time()
+        }
+        
         await query.message.edit_text(f"""
-**🎟️ Generate Redeem Codes**
+📝 **Generate Redeem Codes**
 
-**Selected Duration:** {days} day(s)
+**Duration:** {days} day(s)
 
-**Please enter the quantity of codes to generate (1-50):**
+**How many codes do you want to generate?**
 
-Type a number between 1 and 50 to generate that many codes.
-""")
+Please enter a number between **1** and **50**:
+
+Example: Type `5` to generate 5 codes""")
     
     elif data.startswith("removepremium_"):
         user_id = int(data.split("_")[1])
@@ -296,4 +313,3 @@ Type a number between 1 and 50 to generate that many codes.
         await query.message.edit_text(f"✅ **Premium removed for user {user_id}**")
     
     await query.answer()
-
